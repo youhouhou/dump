@@ -5,6 +5,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from cut_cross_entropy import linear_cross_entropy
 import gc
 from typing import Optional, Union, Tuple, List
+import matplotlib.pyplot as plt
+import numpy as np
+import time
 
 class LlamaForCausalLM_CCE(LlamaForCausalLM):
     """Llama model with custom forward that directly uses linear_cross_entropy."""
@@ -96,110 +99,186 @@ def measure_memory(func):
     
     return result, peak_memory_mb
 
-def main():
-    # Model name - using Llama
-    model_name = "meta-llama/Llama-2-7b-hf"  # Change to a model you have access to
+def run_benchmark(model_name, token_lengths):
+    """Run benchmark for different token lengths, loading one model at a time."""
     
     # Load the tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
     
-    # Sample text with labels - using a longer sequence to make memory differences more noticeable
-    text = "This is a test of the cross entropy memory usage. Let's see how much memory we save. " * 10
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    # Data collection lists
+    original_memory = []
+    cce_memory = []
+    actual_lengths = []
     
-    # Create labels for loss computation (shifted right by 1)
-    labels = inputs["input_ids"].clone()
+    # Base text for testing
+    base_text = "This is a test of the cross entropy memory usage for benchmarking purposes. "
     
-    print("Loading original LlamaForCausalLM model...")
-    original_model = transformers.LlamaForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    
-    # 1. Measure standard forward pass with loss computation
-    def standard_forward():
-        with torch.no_grad():  # No need for gradients in this test
-            outputs = original_model(**inputs, labels=labels)
-        return outputs
-    
-    _, standard_memory = measure_memory(standard_forward)
-    print(f"Standard model peak memory: {standard_memory:.2f} MB")
-    
-    # Free memory
-    del original_model
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    print("Loading custom LlamaForCausalLM_CCE model...")
-    # 2. Create the custom CCE model
-    # First get the config
-    config = LlamaConfig.from_pretrained(model_name)
-    
-    # Create our custom model with the same config
-    cce_model = LlamaForCausalLM_CCE.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    
-    def cce_forward():
-        with torch.no_grad():
-            outputs = cce_model(**inputs, labels=labels)
-        return outputs
-    
-    _, cce_memory = measure_memory(cce_forward)
-    print(f"CCE model peak memory: {cce_memory:.2f} MB")
-    
-    # Calculate memory savings
-    savings = standard_memory - cce_memory
-    percent_saved = (savings / standard_memory) * 100
-    
-    print(f"\nMemory saved: {savings:.2f} MB ({percent_saved:.2f}%)")
-    
-    # Also test with longer sequences for more dramatic results
-    if savings > 0:
-        print("\nTesting with longer sequence...")
-        long_text = "This is a test of the cross entropy memory usage. Let's see how much memory we save. " * 50
-        long_inputs = tokenizer(long_text, return_tensors="pt").to("cuda")
-        long_labels = long_inputs["input_ids"].clone()
-        
-        def standard_long():
-            with torch.no_grad():
-                outputs = original_model(**long_inputs, labels=long_labels)
-            return outputs
-            
-        def cce_long():
-            with torch.no_grad():
-                outputs = cce_model(**long_inputs, labels=long_labels)
-            return outputs
-        
+    # Test each requested token length
+    for length in token_lengths:
         try:
-            # Load original model again
+            print(f"\n===== Testing with target length: {length} tokens =====")
+            
+            # Create a text that's approximately the right length
+            repetitions = max(1, length // len(tokenizer.encode(base_text)))
+            test_text = base_text * repetitions
+            
+            # Encode and truncate to desired length
+            inputs = tokenizer(test_text, return_tensors="pt", truncation=True, max_length=length)
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            
+            # Get actual token length
+            actual_length = inputs["input_ids"].size(1)
+            print(f"Actual sequence length: {actual_length} tokens")
+            actual_lengths.append(actual_length)
+            
+            # Create labels
+            labels = inputs["input_ids"].clone()
+            
+            # ===== Test original model =====
+            print("Loading original LlamaForCausalLM model...")
             original_model = transformers.LlamaForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.bfloat16,
                 device_map="auto"
             )
             
-            _, standard_long_memory = measure_memory(standard_long)
-            print(f"Standard model long sequence peak memory: {standard_long_memory:.2f} MB")
+            def standard_forward():
+                with torch.no_grad():
+                    outputs = original_model(**inputs, labels=labels)
+                return outputs
             
+            _, std_mem = measure_memory(standard_forward)
+            original_memory.append(std_mem)
+            print(f"Original model memory: {std_mem:.2f} MB")
+            
+            # Clean up original model
             del original_model
             torch.cuda.empty_cache()
             gc.collect()
+            time.sleep(1)  # Give some time for memory to be freed
             
-            _, cce_long_memory = measure_memory(cce_long)
-            print(f"CCE model long sequence peak memory: {cce_long_memory:.2f} MB")
+            # ===== Test CCE model =====
+            print("Loading custom LlamaForCausalLM_CCE model...")
+            cce_model = LlamaForCausalLM_CCE.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto"
+            )
             
-            long_savings = standard_long_memory - cce_long_memory
-            long_percent_saved = (long_savings / standard_long_memory) * 100
+            def cce_forward():
+                with torch.no_grad():
+                    outputs = cce_model(**inputs, labels=labels)
+                return outputs
             
-            print(f"\nLong sequence memory saved: {long_savings:.2f} MB ({long_percent_saved:.2f}%)")
+            _, cce_mem = measure_memory(cce_forward)
+            cce_memory.append(cce_mem)
+            print(f"CCE model memory: {cce_mem:.2f} MB")
+            
+            # Clean up CCE model
+            del cce_model
+            torch.cuda.empty_cache()
+            gc.collect()
+            time.sleep(1)  # Give some time for memory to be freed
+            
+            # Calculate and show savings
+            savings = std_mem - cce_mem
+            percent_saved = (savings / std_mem) * 100
+            print(f"Memory saved: {savings:.2f} MB ({percent_saved:.2f}%)")
             
         except RuntimeError as e:
-            print(f"Error with long sequence test: {e}")
-            print("This likely means the CCE version is more memory efficient!")
+            print(f"Error at length {length}: {e}")
+            # Keep the results we've collected so far
+            break
+    
+    return actual_lengths, original_memory, cce_memory
+
+def plot_results(lengths, original_memory, cce_memory):
+    plt.figure(figsize=(12, 8))
+    
+    # Filter out any None values
+    valid_indices = [i for i, (o, c) in enumerate(zip(original_memory, cce_memory)) 
+                     if o is not None and c is not None]
+    valid_lengths = [lengths[i] for i in valid_indices]
+    valid_orig = [original_memory[i] for i in valid_indices]
+    valid_cce = [cce_memory[i] for i in valid_indices]
+    
+    plt.plot(valid_lengths, valid_orig, 'o-', label='Original LlamaForCausalLM', linewidth=2)
+    plt.plot(valid_lengths, valid_cce, 's-', label='LlamaForCausalLM_CCE', linewidth=2)
+    
+    # Calculate the memory savings
+    savings = [orig - cce for orig, cce in zip(valid_orig, valid_cce)]
+    percent_savings = [(orig - cce) / orig * 100 for orig, cce in zip(valid_orig, valid_cce)]
+    
+    # Add a third line for the savings percentage
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+    ax2.plot(valid_lengths, percent_savings, 'g--', label='Memory Savings %', linewidth=2)
+    ax2.set_ylabel('Memory Savings (%)', color='g', fontsize=12)
+    ax2.tick_params(axis='y', labelcolor='g')
+    
+    # Set up the plot
+    plt.title('Memory Usage vs Sequence Length', fontsize=16)
+    ax1.set_xlabel('Sequence Length (tokens)', fontsize=12)
+    ax1.set_ylabel('GPU Memory Usage (MB)', fontsize=12)
+    
+    # Add grid
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+    
+    # Annotate with actual values at a few points
+    for i in range(0, len(valid_lengths), max(1, len(valid_lengths) // 5)):
+        ax1.annotate(f"{valid_orig[i]:.1f} MB", 
+                     (valid_lengths[i], valid_orig[i]), 
+                     textcoords="offset points", 
+                     xytext=(0,10), 
+                     ha='center')
+        
+        ax1.annotate(f"{valid_cce[i]:.1f} MB", 
+                     (valid_lengths[i], valid_cce[i]), 
+                     textcoords="offset points", 
+                     xytext=(0,-15), 
+                     ha='center')
+        
+        ax2.annotate(f"{percent_savings[i]:.1f}%", 
+                     (valid_lengths[i], percent_savings[i]), 
+                     textcoords="offset points", 
+                     xytext=(10,0), 
+                     ha='left',
+                     color='g')
+    
+    plt.tight_layout()
+    plt.savefig('memory_usage_comparison.png', dpi=300)
+    print("Plot saved as 'memory_usage_comparison.png'")
+    plt.show()
+
+def main():
+    # Model name - using Llama or another model you have access to
+    model_name = "meta-llama/Llama-2-7b-hf"  # Change as needed
+    
+    # Define sequence lengths to test
+    # Start small and increase gradually
+    token_lengths = [32, 64, 128, 256, 512, 1024, 2048, 4096]
+    
+    # Optional: add more extreme lengths if your GPU can handle it
+    if torch.cuda.get_device_properties(0).total_memory > 24 * 1024**3:  # More than 24GB VRAM
+        token_lengths.extend([8192, 16384])
+    
+    print(f"Running benchmark with token lengths: {token_lengths}")
+    lengths, original_memory, cce_memory = run_benchmark(model_name, token_lengths)
+    
+    print("\nResults summary:")
+    for l, o, c in zip(lengths, original_memory, cce_memory):
+        if o is not None and c is not None:
+            savings = o - c
+            percent = (savings / o) * 100
+            print(f"Length {l}: Original {o:.2f} MB, CCE {c:.2f} MB, Savings {savings:.2f} MB ({percent:.2f}%)")
+    
+    # Plot the results
+    plot_results(lengths, original_memory, cce_memory)
 
 if __name__ == "__main__":
     main()
