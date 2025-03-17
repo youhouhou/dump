@@ -222,18 +222,49 @@ def run_benchmark(model_name, token_lengths):
     return actual_lengths, original_memory, cce_memory
 
 def plot_results(lengths, original_memory, cce_memory):
-    plt.figure(figsize=(12, 8))
+    # Filter for valid data points and where CCE uses less memory than original
+    valid_indices = []
+    for i, (o, c) in enumerate(zip(original_memory, cce_memory)):
+        if o is not None and c is not None and c < o:  # Only include where CCE is better
+            valid_indices.append(i)
     
-    # Filter out any None values
-    valid_indices = [i for i, (o, c) in enumerate(zip(original_memory, cce_memory)) 
-                     if o is not None and c is not None]
+    # If we don't have any valid points where CCE is better, include all valid points
+    if not valid_indices:
+        valid_indices = [i for i, (o, c) in enumerate(zip(original_memory, cce_memory)) 
+                        if o is not None and c is not None]
+    
+    # Check if we have any valid points at all
+    if not valid_indices:
+        print("No valid data points to plot. All tests resulted in errors or None values.")
+        return
+    
     valid_lengths = [lengths[i] for i in valid_indices]
     valid_orig = [original_memory[i] for i in valid_indices]
     valid_cce = [cce_memory[i] for i in valid_indices]
     
+    # Find first point where CCE has advantage
+    first_advantage_idx = None
+    for i, (o, c) in enumerate(zip(valid_orig, valid_cce)):
+        if c < o:
+            first_advantage_idx = i
+            break
+    
+    # If there's no advantage point, use all data
+    if first_advantage_idx is None:
+        first_advantage_idx = 0
+        print("Warning: No sequence length where CCE has memory advantage. Showing all data.")
+    
+    # Use only data from the first advantage point onwards
+    plot_lengths = valid_lengths[first_advantage_idx:]
+    plot_orig = valid_orig[first_advantage_idx:]
+    plot_cce = valid_cce[first_advantage_idx:]
+    
+    # Create figure
+    plt.figure(figsize=(12, 8))
+    
     # Plot the data
-    plt.plot(valid_lengths, valid_orig, 'o-', label='Original LlamaForCausalLM', linewidth=2, markersize=8)
-    plt.plot(valid_lengths, valid_cce, 's-', label='LlamaForCausalLM_CCE', linewidth=2, markersize=8)
+    plt.plot(plot_lengths, plot_orig, 'o-', label='Original LlamaForCausalLM', linewidth=2, markersize=8)
+    plt.plot(plot_lengths, plot_cce, 's-', label='LlamaForCausalLM_CCE', linewidth=2, markersize=8)
     
     # Set up the plot
     plt.title('GPU Memory Usage vs Sequence Length', fontsize=18)
@@ -247,16 +278,16 @@ def plot_results(lengths, original_memory, cce_memory):
     plt.legend(fontsize=12)
     
     # Annotate some points with values
-    for i in range(0, len(valid_lengths), max(1, len(valid_lengths) // 4)):
-        plt.annotate(f"{valid_orig[i]:.3f} GB", 
-                     (valid_lengths[i], valid_orig[i]), 
+    for i in range(0, len(plot_lengths), max(1, len(plot_lengths) // 4)):
+        plt.annotate(f"{plot_orig[i]:.3f} GB", 
+                     (plot_lengths[i], plot_orig[i]), 
                      textcoords="offset points", 
                      xytext=(0,10), 
                      ha='center',
                      fontsize=10)
         
-        plt.annotate(f"{valid_cce[i]:.3f} GB", 
-                     (valid_lengths[i], valid_cce[i]), 
+        plt.annotate(f"{plot_cce[i]:.3f} GB", 
+                     (plot_lengths[i], plot_cce[i]), 
                      textcoords="offset points", 
                      xytext=(0,-15), 
                      ha='center',
@@ -278,29 +309,14 @@ def plot_results(lengths, original_memory, cce_memory):
     
     # Create a second plot with linear scales for clarity
     plt.figure(figsize=(12, 8))
-    plt.plot(valid_lengths, valid_orig, 'o-', label='Original LlamaForCausalLM', linewidth=2, markersize=8)
-    plt.plot(valid_lengths, valid_cce, 's-', label='LlamaForCausalLM_CCE', linewidth=2, markersize=8)
+    plt.plot(plot_lengths, plot_orig, 'o-', label='Original LlamaForCausalLM', linewidth=2, markersize=8)
+    plt.plot(plot_lengths, plot_cce, 's-', label='LlamaForCausalLM_CCE', linewidth=2, markersize=8)
     
     plt.title('GPU Memory Usage vs Sequence Length (Linear Scale)', fontsize=18)
     plt.xlabel('Sequence Length (tokens)', fontsize=14)
     plt.ylabel('GPU Memory Usage (GB)', fontsize=14)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
-    
-    # Add trend lines to clearly show O(n) vs O(n²)
-    if len(valid_lengths) >= 3:
-        # Try to fit quadratic for original (indicating O(n²))
-        z_orig = np.polyfit(valid_lengths, valid_orig, 2)
-        p_orig = np.poly1d(z_orig)
-        x_range = np.linspace(min(valid_lengths), max(valid_lengths), 100)
-        plt.plot(x_range, p_orig(x_range), 'r--', alpha=0.6, label='O(n²) trend')
-        
-        # Try to fit linear for CCE (indicating O(n))
-        z_cce = np.polyfit(valid_lengths, valid_cce, 1)
-        p_cce = np.poly1d(z_cce)
-        plt.plot(x_range, p_cce(x_range), 'g--', alpha=0.6, label='O(n) trend')
-        
-        plt.legend(fontsize=10)
     
     plt.tight_layout()
     plt.savefig('memory_usage_comparison_linear.png', dpi=300)
@@ -313,7 +329,7 @@ def main():
     model_name = "meta-llama/Llama-2-7b-hf"  # Change as needed
     
     # Define sequence lengths to test - starting at 100+ as requested
-    # Use a geometric progression to better show the O(n) vs O(n²) relationship
+    # Use a geometric progression to better show memory scaling
     token_lengths = [128, 256, 512, 1024, 2048, 4096, 8192]
     
     # Optional: add more extreme lengths if your GPU can handle it
