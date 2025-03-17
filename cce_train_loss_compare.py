@@ -1,0 +1,326 @@
+import os
+import torch
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from datasets import load_from_disk
+from transformers import (
+    LlamaForCausalLM,
+    LlamaTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    TrainerCallback,
+    set_seed,
+)
+from cut_cross_entropy.transformers import cce_patch
+
+# Set seed for reproducibility
+SEED = 42
+set_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+
+# Helper function to clear GPU memory
+def clear_gpu_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        print(f"GPU memory cleared")
+
+
+# Helper function to print memory usage
+def print_gpu_memory():
+    if torch.cuda.is_available():
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+
+
+# Configuration
+MODEL_NAME = "meta-llama/Llama-3-8B"  # Use smaller model if needed, like TinyLlama
+OUTPUT_DIR = "./llama_sft_experiment"
+NUM_TRAIN_EPOCHS = 1
+BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 4
+LEARNING_RATE = 2e-5
+MAX_SEQ_LENGTH = 512
+NUM_SAMPLES = 200  # Small subset for quick comparison
+
+# Create output directory
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Load tokenizer
+print("Loading tokenizer...")
+tokenizer = LlamaTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
+
+# Load dataset from local disk
+print("Loading dataset from disk...")
+dataset = load_from_disk("./local_summarize_dataset")
+
+# Use validation split for training
+print(f"Using validation split for training...")
+print(f"Validation set size: {len(dataset['validation'])}")
+train_dataset = dataset["validation"].select(
+    range(min(NUM_SAMPLES, len(dataset["validation"])))
+)
+
+
+# Preprocess data
+def preprocess_function(examples):
+    # Format as simple instruction following
+    texts = []
+    for info, summary_data in zip(examples["info"], examples["summary"]):
+        post = info["post"]
+        summary_text = summary_data["text"]
+        texts.append(
+            f"Summarize the following text:\n\n{post}\n\nSummary: {summary_text}"
+        )
+
+    tokenized = tokenizer(
+        texts,
+        truncation=True,
+        max_length=MAX_SEQ_LENGTH,
+        padding="max_length",
+        return_tensors="pt",
+    )
+
+    # Create labels (for causal language modeling)
+    tokenized["labels"] = tokenized["input_ids"].clone()
+
+    return tokenized
+
+
+# Tokenize dataset
+print("Tokenizing dataset...")
+tokenized_dataset = train_dataset.map(
+    preprocess_function, batched=True, remove_columns=train_dataset.column_names
+)
+# Define data collator
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+
+# Define custom logging callback
+class LossLoggingCallback(TrainerCallback):
+    def __init__(self):
+        self.training_loss = []
+        self.training_steps = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs:
+            self.training_loss.append(logs["loss"])
+            self.training_steps.append(state.global_step)
+
+
+# Define training arguments
+def get_training_args(model_type):
+    return TrainingArguments(
+        output_dir=os.path.join(OUTPUT_DIR, model_type),
+        num_train_epochs=NUM_TRAIN_EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        weight_decay=0.01,
+        warmup_steps=100,
+        logging_steps=1,
+        save_steps=500,
+        save_total_limit=2,
+        remove_unused_columns=False,
+        report_to="none",  # Disable wandb/tensorboard
+        fp16=True,  # Enable mixed precision
+        seed=SEED,  # Ensure same seed used for both runs
+    )
+
+
+# =================== TRAIN ORIGINAL MODEL ===================
+print("=" * 50)
+print("PHASE 1: TRAINING ORIGINAL MODEL")
+print("=" * 50)
+
+# Load the original model
+print("Loading original model...")
+original_model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
+print_gpu_memory()
+
+# Train the original model
+print("Training original model...")
+original_callback = LossLoggingCallback()
+original_training_args = get_training_args("original")
+
+original_trainer = Trainer(
+    model=original_model,
+    args=original_training_args,
+    train_dataset=tokenized_dataset,
+    data_collator=data_collator,
+    callbacks=[original_callback],
+)
+
+original_trainer.train()
+original_losses = original_callback.training_loss
+
+# Save original model losses
+torch.save(
+    {"original_losses": original_losses}, os.path.join(OUTPUT_DIR, "original_losses.pt")
+)
+
+# Clear memory
+del original_model
+del original_trainer
+clear_gpu_memory()
+print_gpu_memory()
+
+# =================== TRAIN PATCHED MODEL ===================
+print("\n" + "=" * 50)
+print("PHASE 2: TRAINING PATCHED MODEL")
+print("=" * 50)
+
+# Load model again for patched version
+print("Loading model for patching...")
+patched_model = LlamaForCausalLM.from_pretrained(MODEL_NAME)
+print_gpu_memory()
+
+# Apply the CCE patch
+print("Applying CCE patch...")
+patched_model = cce_patch(
+    patched_model, impl="cce_exact"
+)  # Using cce_exact for accuracy
+print("Patch applied successfully!")
+
+# Train the patched model
+print("Training patched model...")
+patched_callback = LossLoggingCallback()
+patched_training_args = get_training_args("patched")
+
+patched_trainer = Trainer(
+    model=patched_model,
+    args=patched_training_args,
+    train_dataset=tokenized_dataset,
+    data_collator=data_collator,
+    callbacks=[patched_callback],
+)
+
+patched_trainer.train()
+patched_losses = patched_callback.training_loss
+
+# Save patched model losses
+torch.save(
+    {"patched_losses": patched_losses}, os.path.join(OUTPUT_DIR, "patched_losses.pt")
+)
+
+# Clear memory
+del patched_model
+del patched_trainer
+clear_gpu_memory()
+print_gpu_memory()
+
+# =================== ANALYSIS ===================
+print("\n" + "=" * 50)
+print("PHASE 3: ANALYSIS")
+print("=" * 50)
+
+# Load both sets of losses
+original_data = torch.load(os.path.join(OUTPUT_DIR, "original_losses.pt"))
+patched_data = torch.load(os.path.join(OUTPUT_DIR, "patched_losses.pt"))
+
+original_losses = original_data["original_losses"]
+patched_losses = patched_data["patched_losses"]
+
+# Save combined losses
+torch.save(
+    {"original_losses": original_losses, "patched_losses": patched_losses},
+    os.path.join(OUTPUT_DIR, "combined_loss_data.pt"),
+)
+
+# Find the minimum length to compare (in case one run had fewer steps)
+min_length = min(len(original_losses), len(patched_losses))
+original_losses = original_losses[:min_length]
+patched_losses = patched_losses[:min_length]
+
+# Plot loss comparison
+plt.figure(figsize=(12, 6))
+plt.plot(original_losses, label="Original Cross-Entropy", color="blue", alpha=0.7)
+plt.plot(
+    patched_losses, label="Patched Cross-Entropy (cce_exact)", color="red", alpha=0.7
+)
+
+# Add smoothed lines if there are enough data points
+if min_length > 50:
+    window_size = min(50, min_length // 10)  # Adjust window size based on data amount
+
+    # Simple moving average for smoothing
+    def smooth(data, window_size):
+        return np.convolve(data, np.ones(window_size) / window_size, mode="valid")
+
+    original_smooth = smooth(original_losses, window_size)
+    patched_smooth = smooth(patched_losses, window_size)
+
+    # Calculate x-positions for smoothed data
+    x_smooth = range(window_size - 1, min_length)
+
+    # Plot smoothed lines
+    plt.plot(
+        x_smooth,
+        original_smooth,
+        label="Original (Smoothed)",
+        color="blue",
+        linestyle="--",
+    )
+    plt.plot(
+        x_smooth,
+        patched_smooth,
+        label="Patched (Smoothed)",
+        color="red",
+        linestyle="--",
+    )
+
+plt.title("Training Loss Comparison", fontsize=14)
+plt.xlabel("Steps", fontsize=12)
+plt.ylabel("Loss", fontsize=12)
+plt.legend(fontsize=10)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "loss_comparison.png"), dpi=300)
+plt.close()
+
+# Add an additional visualization to better highlight convergence differences
+plt.figure(figsize=(12, 6))
+
+# Plot the ratio of losses (can highlight relative performance differences)
+loss_ratio = [p / o if o > 0 else 1.0 for o, p in zip(original_losses, patched_losses)]
+plt.plot(loss_ratio, label="Loss Ratio (Patched/Original)", color="purple")
+plt.axhline(y=1.0, color="k", linestyle="--", alpha=0.5)
+plt.title("Relative Performance: Patched vs Original Model", fontsize=14)
+plt.xlabel("Steps", fontsize=12)
+plt.ylabel("Loss Ratio", fontsize=12)
+plt.legend(fontsize=10)
+plt.grid(True, linestyle="--", alpha=0.7)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "loss_ratio.png"), dpi=300)
+plt.close()
+
+# Save the analysis results in a text file
+with open(os.path.join(OUTPUT_DIR, "analysis_results.txt"), "w") as f:
+    f.write("Loss Comparison Analysis\n")
+    f.write("=======================\n\n")
+    f.write(f"Number of steps compared: {min_length}\n")
+    f.write(f"Average original loss: {sum(original_losses) / min_length:.6f}\n")
+    f.write(f"Average patched loss: {sum(patched_losses) / min_length:.6f}\n")
+    # f.write(f"Average loss difference: {avg_diff:.6f}\n")
+    # f.write(f"Maximum loss difference: {max_diff:.6f}\n")
+    # f.write(f"Minimum loss difference: {min_diff:.6f}\n")
+
+    # Calculate and add final loss difference
+    final_diff_pct = (
+        (original_losses[-1] - patched_losses[-1]) / original_losses[-1]
+    ) * 100
+    f.write(
+        f"Final loss values - Original: {original_losses[-1]:.6f}, Patched: {patched_losses[-1]:.6f}\n"
+    )
+    f.write(
+        f"Final loss difference: {original_losses[-1] - patched_losses[-1]:.6f} ({final_diff_pct:.2f}%)\n"
+    )
+
+print("Enhanced analysis completed successfully!")
