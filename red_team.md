@@ -84,3 +84,17 @@ Putting it Together for the Hackathon:
 Your "fancy" project is an Adaptive, Multi-Lingual Customer Service Red Team Agent. It uses LLM-driven reasoning (GOAT) to conduct multi-turn attacks, intelligently selects attack types based on past success rates stored in memory (AutoRedTeamer), can probe vulnerabilities in multiple languages via translation (MM-ART), and provides categorized reports on the weaknesses found.
 
 This combination strongly hits all the judging criteria, showcasing innovation, technical depth, agentic capabilities, clear impact, and a nod towards production readiness.
+
+
+------
+
+## ref
+
+### bench mark
+https://arxiv.org/html/2405.12063v2#abstract
+https://arxiv.org/html/2503.15739v1
+
+### fancy
+https://arxiv.org/pdf/2410.13788
+https://arxiv.org/pdf/2404.11972v1
+https://aclanthology.org/2023.findings-emnlp.772.pdf
