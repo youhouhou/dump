@@ -179,3 +179,112 @@ def calculate_multitoken_label_confidence(
 
 # except Exception as e:
 #     print(f"API call or processing failed: {e}")
+
+
+
+
+
+from typing import Optional, List, Dict, Any
+import math
+
+def extract_logprobs_between_token_sequences(
+    response: Any, # Expects OpenAI ChatCompletion response object
+    start_token_sequence: List[str] = ['<', ' current', '_turn', '_label'],
+    end_token_sequence: List[str] = ['</', ' current', '_turn', '_label']
+) -> Optional[Dict[str, Any]]:
+    """
+    Finds fixed start and end token sequences in the logprobs list and
+    extracts the token information between them.
+
+    Args:
+        response: The response object from OpenAI API (must include logprobs).
+        start_token_sequence: The exact list of token strings marking the
+                               start of the tag (exclusive).
+        end_token_sequence: The exact list of token strings marking the
+                             end of the tag (exclusive).
+
+    Returns:
+        A dictionary containing:
+        - 'extracted_text': The text content reconstructed from tokens between
+                            the sequences.
+        - 'matched_tokens_info': A list of token info objects found between
+                                the start and end sequences.
+        - 'avg_logprob': The average log probability for the matched tokens.
+        - 'num_tokens': The number of tokens matched.
+        Returns None if the start or end sequences are not found in order.
+    """
+    try:
+        # --- Basic response validation ---
+        if not response.choices or not response.choices[0].logprobs:
+            # print("Error: Response object structure is invalid or missing logprobs.")
+            return None
+        logprob_content_list = response.choices[0].logprobs.content
+        if not logprob_content_list:
+            # print("Error: Logprob list is empty.")
+            return None
+
+        n_logprobs = len(logprob_content_list)
+        len_start_seq = len(start_token_sequence)
+        len_end_seq = len(end_token_sequence)
+
+        start_tag_end_index = -1
+        end_tag_start_index = -1
+
+        # --- Find the end index of the start sequence ---
+        for i in range(n_logprobs - len_start_seq + 1):
+            # Extract the tokens for the current slice
+            current_slice_tokens = [logprob_content_list[i + k].token for k in range(len_start_seq)]
+            # Compare with the target start sequence
+            if current_slice_tokens == start_token_sequence:
+                start_tag_end_index = i + len_start_seq
+                # print(f"Found start sequence ending at index {start_tag_end_index}") # Debug
+                break # Found the first occurrence
+
+        if start_tag_end_index == -1:
+            # print("Error: Start token sequence not found.")
+            return None
+
+        # --- Find the start index of the end sequence (must be AFTER the start tag) ---
+        for j in range(start_tag_end_index, n_logprobs - len_end_seq + 1):
+             # Extract the tokens for the current slice
+            current_slice_tokens = [logprob_content_list[j + k].token for k in range(len_end_seq)]
+             # Compare with the target end sequence
+            if current_slice_tokens == end_token_sequence:
+                end_tag_start_index = j
+                # print(f"Found end sequence starting at index {end_tag_start_index}") # Debug
+                break # Found the first occurrence after the start tag
+
+        if end_tag_start_index == -1:
+            # print("Error: End token sequence not found after start sequence.")
+            return None
+
+        # --- Extract the tokens between the found sequences ---
+        if start_tag_end_index > end_tag_start_index:
+             # This shouldn't happen with the loop logic, but sanity check
+             # print("Error: End tag found before start tag ended?")
+             return None
+
+        content_tokens_info = logprob_content_list[start_tag_end_index : end_tag_start_index]
+
+        # --- Calculate results ---
+        num_tokens = len(content_tokens_info)
+        extracted_text = "".join(t.token for t in content_tokens_info)
+        avg_logprob = None
+        if num_tokens > 0:
+            logprobs = [t.logprob for t in content_tokens_info]
+            avg_logprob = sum(logprobs) / num_tokens
+
+        return {
+            "extracted_text": extracted_text,
+            "matched_tokens_info": content_tokens_info, # Contains full info per token
+            "avg_logprob": avg_logprob,
+            "num_tokens": num_tokens
+        }
+
+    except Exception as e:
+        # print(f"An unexpected error occurred during token sequence matching: {e}")
+        # import traceback
+        # traceback.print_exc() # More detailed error for debugging
+        return None
+
+# --- Example Usage ---
